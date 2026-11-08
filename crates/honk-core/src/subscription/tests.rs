@@ -306,7 +306,7 @@ fn test_parse_subscription_keeps_valid_sibling_after_intrinsic_rejection() {
 }
 
 #[test]
-fn test_parse_subscription_skips_proxy_plugins() {
+fn test_parse_subscription_imports_obfs_but_skips_other_plugins() {
     let clash = Subscription {
         sub_type: SubscriptionType::Clash,
         ..Default::default()
@@ -324,6 +324,13 @@ fn test_parse_subscription_skips_proxy_plugins() {
     plugin-opts:
       mode: http
       host: mask.example
+  - name: v2ray
+    type: ss
+    server: ss.example
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+    plugin: v2ray-plugin
   - name: plain
     type: socks5
     server: 127.0.0.1
@@ -331,8 +338,16 @@ fn test_parse_subscription_skips_proxy_plugins() {
 "#,
     )
     .unwrap();
-    assert_eq!(clash_nodes.len(), 1);
-    assert_eq!(clash_nodes[0].name, "plain");
+    // obfs is imported with a normalized plugin; v2ray-plugin stays skipped.
+    assert_eq!(clash_nodes.len(), 2);
+    let obfs = clash_nodes.iter().find(|node| node.name == "obfs").unwrap();
+    let config = obfs.shadowsocks().unwrap();
+    assert_eq!(config.plugin.as_deref(), Some("obfs-local"));
+    assert_eq!(
+        config.plugin_opts.as_deref(),
+        Some("obfs=http;obfs-host=mask.example")
+    );
+    assert!(clash_nodes.iter().any(|node| node.name == "plain"));
 
     let simple = Subscription {
         sub_type: SubscriptionType::Simple,
@@ -346,8 +361,9 @@ fn test_parse_subscription_skips_proxy_plugins() {
         ),
     )
     .unwrap();
-    assert_eq!(simple_nodes.len(), 1);
-    assert_eq!(simple_nodes[0].name, "plain");
+    assert_eq!(simple_nodes.len(), 2);
+    assert!(simple_nodes.iter().any(|node| node.name == "obfs"));
+    assert!(simple_nodes.iter().any(|node| node.name == "plain"));
 }
 
 #[tokio::test]

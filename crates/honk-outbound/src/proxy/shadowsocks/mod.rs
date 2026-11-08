@@ -30,7 +30,7 @@ mod stream;
 
 use async_trait::async_trait;
 use hkdf::Hkdf;
-use honk_config::node::Node;
+use honk_config::node::{Node, ShadowsocksConfig};
 use rand::Rng;
 use sha1::Sha1;
 use std::fmt;
@@ -393,6 +393,81 @@ impl ShadowsocksHandler {
     }
 }
 
+/// Run the simple-obfs plugin handshake on a freshly connected server socket,
+/// before the Shadowsocks prologue. simple-obfs (HTTP mode) wraps the stream
+/// in a short HTTP request/response exchange; after the response headers the
+/// socket is a transparent byte pipe carrying the normal Shadowsocks stream.
+async fn obfs_http_handshake(server: &mut TcpStream, opts: Option<&str>) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    let mut host = None;
+    let mut saw_mode = false;
+    for pair in opts.unwrap_or_default().split(';') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key.trim() {
+            "obfs" => {
+                saw_mode = true;
+                if !value.trim().eq_ignore_ascii_case("http") {
+                    anyhow::bail!("unsupported simple-obfs mode: {value}; only http is supported");
+                }
+            }
+            "obfs-host" => host = Some(value.trim().to_string()),
+            _ => {}
+        }
+    }
+    if !saw_mode {
+        anyhow::bail!("simple-obfs plugin_opts is missing the obfs=http mode");
+    }
+    let host = host
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("simple-obfs http mode requires obfs-host"))?;
+
+    let request = format!(
+        "GET / HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n\
+         Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n\
+         Accept-Encoding: gzip, deflate\r\n\
+         Accept-Language: en-US,en;q=0.9\r\n\
+         Connection: keep-alive\r\n\
+         \r\n"
+    );
+    server.write_all(request.as_bytes()).await?;
+    server.flush().await?;
+
+    // Drain the response headers byte-by-byte until the terminating CRLF CRLF,
+    // without over-reading into the Shadowsocks stream that follows.
+    let mut last4 = [0u8; 4];
+    let mut byte = [0u8; 1];
+    loop {
+        if server.read(&mut byte).await? == 0 {
+            anyhow::bail!(
+                "simple-obfs handshake failed: connection closed before the response headers"
+            );
+        }
+        last4.rotate_left(1);
+        last4[3] = byte[0];
+        if &last4 == b"\r\n\r\n" {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Apply the Shadowsocks plugin (simple-obfs) handshake when one is configured.
+async fn apply_ss_plugin_handshake(
+    server: &mut TcpStream,
+    config: &ShadowsocksConfig,
+) -> anyhow::Result<()> {
+    let Some(plugin) = config.plugin.as_deref() else {
+        return Ok(());
+    };
+    if !matches!(plugin.trim(), "obfs-local" | "simple-obfs" | "obfs") {
+        anyhow::bail!("unsupported Shadowsocks plugin: {plugin}");
+    }
+    obfs_http_handshake(server, config.plugin_opts.as_deref()).await
+}
+
 #[async_trait]
 impl TcpOutbound for ShadowsocksHandler {
     async fn dial(
@@ -414,7 +489,9 @@ impl TcpOutbound for ShadowsocksHandler {
 
         let addr = format!("{}:{}", node.host(), node.port);
         debug!("Shadowsocks: connecting to {} for target {}", addr, target);
-        let server = crate::util::connect_outbound(&addr, connect_timeout).await?;
+        let mut server = crate::util::connect_outbound(&addr, connect_timeout).await?;
+
+        apply_ss_plugin_handshake(&mut server, config).await?;
 
         let header = addr::encode_address(target, target_domain)?;
         self.start_relay(method, password, server, header, target, target_domain)
@@ -432,6 +509,8 @@ impl TcpOutbound for ShadowsocksHandler {
         let config = node.shadowsocks().unwrap();
         let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
         let password = config.password.as_deref().unwrap_or("");
+        let mut server = server;
+        apply_ss_plugin_handshake(&mut server, config).await?;
         let header = addr::encode_address(target, target_domain)?;
         self.start_relay(method, password, server, header, target, target_domain)
             .await

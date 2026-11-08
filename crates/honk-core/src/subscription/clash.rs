@@ -4,7 +4,7 @@ mod fields;
 pub(super) mod options;
 mod xhttp;
 
-use honk_config::node::{Node, OutboundConfig};
+use honk_config::node::{Node, OutboundConfig, ShadowsocksConfig};
 use honk_config::options::vocab::{optional_flow, packet_network, xhttp_stream_transport};
 use honk_config::types::NodeProtocol;
 use serde_yaml::Mapping;
@@ -132,12 +132,13 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
         return Err("XHTTP options require a stream protocol");
     }
 
-    reject_active_unless(
-        mapping,
-        &["plugin", "plugin-opts", "plugin_opts"],
-        false,
-        "proxy plugins are unsupported",
-    )?;
+    // simple-obfs (obfs-local) is the only plugin honk supports, and only
+    // for Shadowsocks; reject it for every other protocol.
+    if has_active(mapping, &["plugin", "plugin-opts", "plugin_opts"])
+        && protocol != NodeProtocol::SS
+    {
+        return Err("proxy plugins are only supported for Shadowsocks");
+    }
     if !supports_tls(protocol)
         && has_active_for_key(
             mapping,
@@ -310,6 +311,7 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
         OutboundConfig::Shadowsocks(config) => {
             config.password = password;
             config.encryption = cipher;
+            apply_ss_plugin(mapping, config)?;
         }
         OutboundConfig::Socks5(config) => {
             config.username = username;
@@ -379,6 +381,51 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
     }
     Ok(())
 }
+/// Parse the Shadowsocks `plugin` / `plugin-opts` fields (Clash or SIP008
+/// vocabulary) into the canonical `plugin = "obfs-local"` +
+/// `plugin_opts = "obfs=http;obfs-host=…"` form. Only simple-obfs (HTTP mode)
+/// is supported today.
+fn apply_ss_plugin(
+    mapping: &Mapping,
+    config: &mut ShadowsocksConfig,
+) -> Result<(), &'static str> {
+    let plugin = yaml_text_alias(mapping, &["plugin"])?;
+    let Some(plugin) = plugin.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    if !matches!(plugin.trim(), "obfs-local" | "simple-obfs" | "obfs") {
+        return Err("unsupported Shadowsocks plugin; only simple-obfs (obfs) is supported");
+    }
+    config.plugin = Some("obfs-local".to_string());
+
+    let opts = yaml_value(mapping, "plugin-opts")
+        .or_else(|| yaml_value(mapping, "plugin_opts"));
+    match opts {
+        None | Some(serde_yaml::Value::Null) => {}
+        Some(serde_yaml::Value::String(value)) => {
+            // Already canonical (e.g. SIP008 `plugin_opts: "obfs=http;obfs-host=…"`).
+            config.plugin_opts = Some(value.clone());
+        }
+        Some(serde_yaml::Value::Mapping(value)) => {
+            let mode = yaml_text_alias(value, &["mode"])?;
+            match mode.as_deref() {
+                Some("http") => {}
+                Some("tls") => {
+                    return Err("simple-obfs tls mode is not yet supported; only http mode is");
+                }
+                Some(_) => return Err("unsupported simple-obfs mode; expected http"),
+                None => {}
+            }
+            let host = yaml_text_alias(value, &["host", "obfs-host", "obfs_host"])?
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("simple-obfs http mode requires an obfs-host")?;
+            config.plugin_opts = Some(format!("obfs=http;obfs-host={host}"));
+        }
+        Some(_) => return Err("plugin-opts must be a map or a string"),
+    }
+    Ok(())
+}
+
 fn resolve_anytls_network(
     mapping: &Mapping,
     udp: Option<bool>,

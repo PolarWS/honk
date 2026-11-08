@@ -164,14 +164,10 @@ impl<'a> AdmissionOwner<'a> {
         match kind {
             IndexedOutcomeKind::Node(node) => {
                 if node.shadowsocks().is_some_and(|config| {
-                    config
-                        .plugin
-                        .as_deref()
-                        .is_some_and(|value| !value.trim().is_empty())
-                        || config
-                            .plugin_opts
-                            .as_deref()
-                            .is_some_and(|value| !value.trim().is_empty())
+                    config.plugin.as_deref().is_some_and(|value| {
+                        !value.trim().is_empty()
+                            && !matches!(value.trim(), "obfs-local" | "simple-obfs" | "obfs")
+                    })
                 }) {
                     self.emit_indexed(
                         "unsupported-subscription-entry",
