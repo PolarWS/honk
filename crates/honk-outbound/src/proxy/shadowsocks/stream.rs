@@ -429,6 +429,10 @@ pub(crate) struct LegacyPrologue {
     pub(crate) conf: CipherConf,
     pub(crate) master_key: Vec<u8>,
     pub(crate) method: String,
+    /// When the stream is wrapped in simple-obfs (HTTP mode), the server's
+    /// response headers are prepended to the first Shadowsocks response and
+    /// must be stripped before the response salt is read.
+    pub(crate) strip_obfs_response: bool,
 }
 
 impl LegacyPrologue {
@@ -436,6 +440,27 @@ impl LegacyPrologue {
         self,
         mut read_half: OwnedReadHalf,
     ) -> io::Result<(OwnedReadHalf, AeadCipher, Vec<u8>, Vec<u8>)> {
+        if self.strip_obfs_response {
+            // Drain the simple-obfs response headers byte-by-byte up to the
+            // terminating CRLF CRLF, without over-reading into the Shadowsocks
+            // response that follows.
+            let mut last4 = [0u8; 4];
+            let mut byte = [0u8; 1];
+            loop {
+                if read_half.read(&mut byte).await? == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "simple-obfs handshake failed: connection closed before the response headers",
+                    ));
+                }
+                last4.rotate_left(1);
+                last4[3] = byte[0];
+                if &last4 == b"\r\n\r\n" {
+                    break;
+                }
+            }
+        }
+
         let mut recv_salt = vec![0u8; self.conf.salt_len];
         read_half.read_exact(&mut recv_salt).await?;
         let mut recv_subkey = vec![0u8; self.conf.key_len];

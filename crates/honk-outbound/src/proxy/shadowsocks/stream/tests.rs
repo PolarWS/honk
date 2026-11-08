@@ -201,6 +201,7 @@ async fn legacy_deferred_response_salt() {
         conf,
         master_key: send_master,
         method: METHOD.to_string(),
+        strip_obfs_response: false,
     };
     // Emulate the handler's legacy dial tail through its production constructor.
     let mut stream = SsStream::new_legacy(server, send_cipher, send_nonce, prologue);
